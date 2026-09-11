@@ -125,6 +125,293 @@ http.HandleFunc("/me", func(w http.ResponseWriter, r *http.Request) {
 
 If you already have the JWKS URL, or need custom refresh intervals or HTTP clients, use `keygonomics.New(jwksURL)` or build a [keyfunc](https://github.com/MicahParks/keyfunc) yourself and pass it to `keygonomics.NewWithKeyfunc`.
 
+## API reference
+
+Every exported symbol, with a minimal example. Full signatures are on [pkg.go.dev](https://pkg.go.dev/github.com/mobn0/keygonomics).
+
+### Package `keygonomics` (core)
+
+Import: `github.com/mobn0/keygonomics`
+
+#### `Verifier`
+
+Verifies Keycloak tokens against a realm's JWKS. Safe for concurrent use. Create one at startup and share it; it caches the keys and refreshes them in the background.
+
+```go
+var verifier *keygonomics.Verifier // created once, used by every handler
+```
+
+#### `NewFromIssuer(issuerURL string) (*Verifier, error)`
+
+The usual constructor. Takes the realm's issuer URL (the same value as the `iss` claim in your tokens) and derives the JWKS endpoint from it.
+
+```go
+verifier, err := keygonomics.NewFromIssuer("https://sso.example.com/realms/myrealm")
+if err != nil {
+	log.Fatal(err) // JWKS could not be fetched: wrong URL, realm down, TLS problem
+}
+```
+
+#### `New(jwksURL string) (*Verifier, error)`
+
+Same as `NewFromIssuer`, but you give the JWKS URL directly. Useful if your Keycloak sits behind a proxy that rewrites paths.
+
+```go
+verifier, err := keygonomics.New("https://sso.example.com/realms/myrealm/protocol/openid-connect/certs")
+```
+
+#### `NewContext` / `NewFromIssuerContext`
+
+Context-aware versions of `New` and `NewFromIssuer`. The background JWKS refresh goroutine stops when the context is cancelled. Use these if you shut the service down gracefully or create verifiers in tests.
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel() // stops the refresh goroutine
+
+verifier, err := keygonomics.NewFromIssuerContext(ctx, "https://sso.example.com/realms/myrealm")
+```
+
+#### `NewWithKeyfunc(kf keyfunc.Keyfunc) *Verifier`
+
+Wraps an existing [keyfunc](https://github.com/MicahParks/keyfunc) you built yourself. Reach for this when you need a custom refresh interval, HTTP client, several JWKS URLs, or a static key set in tests.
+
+```go
+kf, err := keyfunc.NewDefaultOverrideCtx(ctx, []string{jwksURL}, keyfunc.Override{
+	RefreshInterval: 5 * time.Minute,
+})
+if err != nil {
+	log.Fatal(err)
+}
+verifier := keygonomics.NewWithKeyfunc(kf)
+```
+
+#### `JWKSURL(issuerURL string) string`
+
+Pure helper that turns an issuer URL into the JWKS URL. Trailing slashes are stripped. `NewFromIssuer` uses it internally.
+
+```go
+u := keygonomics.JWKSURL("https://sso.example.com/realms/myrealm/")
+// "https://sso.example.com/realms/myrealm/protocol/openid-connect/certs"
+```
+
+#### `(*Verifier).Verify(rawToken string) (*Claims, error)`
+
+Parses a raw JWT, checks the signature against the JWKS, and validates `exp`, `nbf`, and `iat`. Returns the parsed claims or an error wrapping `ErrInvalidToken`.
+
+```go
+claims, err := verifier.Verify(rawToken)
+if err != nil {
+	// expired, bad signature, unknown key, HMAC, missing exp, garbage...
+	return
+}
+fmt.Println(claims.UUID(), claims.PreferredUsername)
+```
+
+#### `ErrInvalidToken`
+
+Sentinel error wrapped by every failure from `Verify`. Use it to distinguish "bad token" from other errors without inspecting strings.
+
+```go
+if errors.Is(err, keygonomics.ErrInvalidToken) {
+	w.WriteHeader(http.StatusUnauthorized)
+}
+```
+
+#### `ExtractBearerToken(header string) (string, bool)`
+
+Pulls the token out of an `Authorization` header value. The `Bearer` scheme is matched case-insensitively. Returns `false` for a missing header, another scheme (`Basic ...`), or an empty token.
+
+```go
+raw, ok := keygonomics.ExtractBearerToken(r.Header.Get("Authorization"))
+if !ok {
+	http.Error(w, "missing bearer token", http.StatusUnauthorized)
+	return
+}
+```
+
+#### `Claims`
+
+The parsed token. Embeds `jwt.RegisteredClaims` (so `Subject`, `Issuer`, `Audience`, `ExpiresAt`, and friends are available directly) and adds the Keycloak fields:
+
+| Field | JSON claim | Type |
+| --- | --- | --- |
+| `PreferredUsername` | `preferred_username` | `string` |
+| `Email` | `email` | `string` |
+| `RealmAccess` | `realm_access` | `Roles` |
+| `ResourceAccess` | `resource_access` | `map[string]Roles` |
+
+```go
+fmt.Println(claims.Subject)            // from jwt.RegisteredClaims
+fmt.Println(claims.ExpiresAt.Time)     // from jwt.RegisteredClaims
+fmt.Println(claims.PreferredUsername)  // "alice"
+fmt.Println(claims.RealmAccess.Roles)  // ["user", "admin"]
+```
+
+#### `Roles`
+
+The `{"roles": [...]}` object that Keycloak uses for `realm_access` and for each entry of `resource_access`. You mostly won't touch it directly; the helper methods below are more convenient. It is exported so you can build `Claims` values in your own tests.
+
+```go
+claims := keygonomics.Claims{
+	RealmAccess:    keygonomics.Roles{Roles: []string{"admin"}},
+	ResourceAccess: map[string]keygonomics.Roles{"my-api": {Roles: []string{"writer"}}},
+}
+```
+
+#### `(*Claims).UUID() string`
+
+The Keycloak user ID. This is just the `sub` claim, which Keycloak always populates with the user's UUID. Use it as the foreign key for anything you store about the user.
+
+```go
+userID := claims.UUID() // "8d3c0f8a-1e3b-4f6d-9a2c-6b7e8f9a0b1c"
+```
+
+#### `(*Claims).HasRealmRole(role string) bool`
+
+Reports whether the user has a realm-level role. Case-sensitive.
+
+```go
+if !claims.HasRealmRole("admin") {
+	http.Error(w, "forbidden", http.StatusForbidden)
+	return
+}
+```
+
+#### `(*Claims).HasClientRole(client, role string) bool`
+
+Reports whether the user has a role on a specific client. `client` is the client ID from the Keycloak admin console.
+
+```go
+if claims.HasClientRole("reporting-api", "reports:read") {
+	// show reports
+}
+```
+
+#### `(*Claims).RealmRoles() []string`
+
+All realm roles. Never returns `nil`, so it is safe to range over or encode to JSON as `[]`.
+
+```go
+for _, role := range claims.RealmRoles() {
+	fmt.Println(role)
+}
+```
+
+#### `(*Claims).ClientRoles(client string) []string`
+
+All roles for one client. Never returns `nil`; an unknown client gives an empty slice.
+
+```go
+roles := claims.ClientRoles("reporting-api") // e.g. ["reports:read"], or [] if none
+```
+
+### Package `keygin` (Gin adapter)
+
+Import: `keygin "github.com/mobn0/keygonomics/gin"`
+
+The import alias is needed because the directory is named `gin`, which would collide with `github.com/gin-gonic/gin`.
+
+#### `RequireAuth(v *keygonomics.Verifier) gin.HandlerFunc`
+
+The authentication middleware. Reads the `Authorization` header, verifies the token, and stores the claims in the Gin context. Aborts with `401` and a JSON error body if anything is wrong. Attach it to a group so every route beneath it is protected.
+
+```go
+api := r.Group("/api", keygin.RequireAuth(verifier))
+api.GET("/me", meHandler) // only reached with a valid token
+```
+
+You can also attach it to a single route:
+
+```go
+r.GET("/me", keygin.RequireAuth(verifier), meHandler)
+```
+
+#### `RequireRealmRole(role string) gin.HandlerFunc`
+
+Authorization middleware. Must come after `RequireAuth`. Aborts with `403` if the user lacks the realm role, or `401` if no claims are present (which means `RequireAuth` didn't run).
+
+```go
+api.GET("/admin", keygin.RequireRealmRole("admin"), adminHandler)
+
+// Or for a whole group:
+admin := api.Group("/admin", keygin.RequireRealmRole("admin"))
+admin.GET("/users", listUsers)
+admin.DELETE("/users/:id", deleteUser)
+```
+
+#### `RequireClientRole(client, role string) gin.HandlerFunc`
+
+Same as `RequireRealmRole` but checks a client role. `client` is the Keycloak client ID.
+
+```go
+api.GET("/reports", keygin.RequireClientRole("reporting-api", "reports:read"), reportsHandler)
+```
+
+#### `GetClaims(c *gin.Context) (*keygonomics.Claims, bool)`
+
+Returns the full claims stored by `RequireAuth`. The boolean is `false` on routes where `RequireAuth` did not run, so on protected routes you can safely ignore it.
+
+```go
+func meHandler(c *gin.Context) {
+	claims, _ := keygin.GetClaims(c)
+	c.JSON(http.StatusOK, gin.H{
+		"uuid":  claims.UUID(),
+		"email": claims.Email,
+	})
+}
+```
+
+On a route that is optionally authenticated, check the boolean:
+
+```go
+r.GET("/greeting", func(c *gin.Context) {
+	if claims, ok := keygin.GetClaims(c); ok {
+		c.String(http.StatusOK, "hello, "+claims.PreferredUsername)
+		return
+	}
+	c.String(http.StatusOK, "hello, stranger")
+})
+```
+
+#### `GetUUID(c *gin.Context) (string, bool)`
+
+Shortcut for `GetClaims(c)` followed by `.UUID()`. Handy when all you need is the user ID.
+
+```go
+func createOrder(c *gin.Context) {
+	userID, _ := keygin.GetUUID(c)
+	order := db.CreateOrder(userID, ...)
+	c.JSON(http.StatusCreated, order)
+}
+```
+
+#### `GetRealmRoles(c *gin.Context) ([]string, bool)`
+
+Shortcut for `GetClaims(c)` followed by `.RealmRoles()`. The slice is never `nil` when the boolean is `true`.
+
+```go
+roles, _ := keygin.GetRealmRoles(c)
+c.JSON(http.StatusOK, gin.H{"roles": roles})
+```
+
+#### `ClaimsContextKey`
+
+The string key under which `RequireAuth` stores the claims via `c.Set`. Exported so you can read the value with `c.Get` or `c.MustGet` if you prefer, but `GetClaims` does the type assertion for you and is the recommended way.
+
+```go
+claims := c.MustGet(keygin.ClaimsContextKey).(*keygonomics.Claims)
+```
+
+#### `ErrorResponse`
+
+The JSON body sent on `401` and `403`. It has a single `error` field with a short, stable message. Exported so clients and tests can decode it.
+
+```go
+var body keygin.ErrorResponse
+json.Unmarshal(w.Body.Bytes(), &body)
+fmt.Println(body.Error) // "invalid token"
+```
+
 ## Realm roles vs. client roles
 
 Keycloak has two kinds of roles, and they show up in different places in the token. This trips up almost everyone at least once.
