@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -83,8 +84,8 @@ func (f *fixture) router() *gin.Engine {
 	r := gin.New()
 
 	r.GET("/public", func(c *gin.Context) {
-		_, ok := keygonomics.GetClaims(c)
-		c.JSON(http.StatusOK, gin.H{"authenticated": ok})
+		_, err := keygonomics.GetClaims(c)
+		c.JSON(http.StatusOK, gin.H{"authenticated": err == nil})
 	})
 
 	api := r.Group("/api", keygonomics.RequireAuth(f.verifier))
@@ -229,24 +230,24 @@ func TestAccessors(t *testing.T) {
 func TestAccessorsWithoutClaims(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 
-	if claims, ok := keygonomics.GetClaims(c); ok || claims != nil {
-		t.Error("GetClaims on empty context should return (nil, false)")
+	if claims, err := keygonomics.GetClaims(c); !errors.Is(err, keygonomics.ErrNoClaims) || claims != nil {
+		t.Errorf("GetClaims on empty context = (%v, %v), want (nil, ErrNoClaims)", claims, err)
 	}
-	if uuid, ok := keygonomics.GetUUID(c); ok || uuid != "" {
-		t.Error("GetUUID on empty context should return (\"\", false)")
+	if uuid, err := keygonomics.GetUUID(c); !errors.Is(err, keygonomics.ErrNoClaims) || uuid != "" {
+		t.Errorf("GetUUID on empty context = (%q, %v), want (\"\", ErrNoClaims)", uuid, err)
 	}
-	if roles, ok := keygonomics.GetRealmRoles(c); ok || roles != nil {
-		t.Error("GetRealmRoles on empty context should return (nil, false)")
+	if roles, err := keygonomics.GetRealmRoles(c); !errors.Is(err, keygonomics.ErrNoClaims) || roles != nil {
+		t.Errorf("GetRealmRoles on empty context = (%v, %v), want (nil, ErrNoClaims)", roles, err)
 	}
 
 	// Wrong type stored under the key must not panic.
 	c.Set(keygonomics.ClaimsContextKey, "not claims")
-	if _, ok := keygonomics.GetClaims(c); ok {
+	if _, err := keygonomics.GetClaims(c); !errors.Is(err, keygonomics.ErrNoClaims) {
 		t.Error("GetClaims should reject a value of the wrong type")
 	}
 	var nilClaims *keygonomics.Claims
 	c.Set(keygonomics.ClaimsContextKey, nilClaims)
-	if _, ok := keygonomics.GetClaims(c); ok {
+	if _, err := keygonomics.GetClaims(c); !errors.Is(err, keygonomics.ErrNoClaims) {
 		t.Error("GetClaims should reject a nil *Claims")
 	}
 }

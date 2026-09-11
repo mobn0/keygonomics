@@ -215,17 +215,21 @@ if errors.Is(err, keygonomics.ErrInvalidToken) {
 }
 ```
 
-#### `ExtractBearerToken(header string) (string, bool)`
+#### `ExtractBearerToken(header string) (string, error)`
 
-Pulls the token out of an `Authorization` header value. The `Bearer` scheme is matched case-insensitively. Returns `false` for a missing header, another scheme (`Basic ...`), or an empty token.
+Pulls the token out of an `Authorization` header value. The `Bearer` scheme is matched case-insensitively. Returns [ErrMissingBearerToken] for a missing header, another scheme (`Basic ...`), or an empty token.
 
 ```go
-raw, ok := keygonomics.ExtractBearerToken(r.Header.Get("Authorization"))
-if !ok {
+raw, err := keygonomics.ExtractBearerToken(r.Header.Get("Authorization"))
+if err != nil {
 	http.Error(w, "missing bearer token", http.StatusUnauthorized)
 	return
 }
 ```
+
+#### `ErrMissingBearerToken`
+
+Sentinel error returned by `ExtractBearerToken` when no bearer token could be found.
 
 #### `Claims`
 
@@ -335,9 +339,9 @@ Same as `RequireRealmRole` but checks a client role. `client` is the Keycloak cl
 api.GET("/reports", keygonomics.RequireClientRole("reporting-api", "reports:read"), reportsHandler)
 ```
 
-#### `GetClaims(c *gin.Context) (*keygonomics.Claims, bool)`
+#### `GetClaims(c *gin.Context) (*keygonomics.Claims, error)`
 
-Returns the full claims stored by `RequireAuth`. The boolean is `false` on routes where `RequireAuth` did not run, so on protected routes you can safely ignore it.
+Returns the full claims stored by `RequireAuth`, or [ErrNoClaims] on routes where `RequireAuth` did not run. On protected routes the error can be safely discarded.
 
 ```go
 func meHandler(c *gin.Context) {
@@ -349,7 +353,7 @@ func meHandler(c *gin.Context) {
 }
 ```
 
-#### `GetUUID(c *gin.Context) (string, bool)`
+#### `GetUUID(c *gin.Context) (string, error)`
 
 Shortcut for `GetClaims(c)` followed by `.UUID()`. Handy when all you need is the user ID.
 
@@ -361,14 +365,18 @@ func createOrder(c *gin.Context) {
 }
 ```
 
-#### `GetRealmRoles(c *gin.Context) ([]string, bool)`
+#### `GetRealmRoles(c *gin.Context) ([]string, error)`
 
-Shortcut for `GetClaims(c)` followed by `.RealmRoles()`. The slice is never `nil` when the boolean is `true`.
+Shortcut for `GetClaims(c)` followed by `.RealmRoles()`. The slice is never `nil` on success.
 
 ```go
 roles, _ := keygonomics.GetRealmRoles(c)
 c.JSON(http.StatusOK, gin.H{"roles": roles})
 ```
+
+#### `ErrNoClaims`
+
+Sentinel error returned by `GetClaims`, `GetUUID`, and `GetRealmRoles` when no verified claims are present in the context, meaning `RequireAuth` has not run for the request.
 
 #### `ClaimsContextKey`
 

@@ -1,10 +1,16 @@
 package keygonomics
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 )
+
+// ErrNoClaims is returned by [GetClaims], [GetUUID], and [GetRealmRoles]
+// when no verified claims are present in the Gin context, meaning
+// [RequireAuth] has not run for the current request.
+var ErrNoClaims = errors.New("keygonomics: no claims in context")
 
 // ClaimsContextKey is the key under which [RequireAuth] stores the verified
 // *Claims in the Gin context. Prefer [GetClaims] over reading it
@@ -27,8 +33,8 @@ type ErrorResponse struct {
 // context under [ClaimsContextKey] and the next handler runs.
 func RequireAuth(v *Verifier) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		raw, ok := ExtractBearerToken(c.GetHeader("Authorization"))
-		if !ok {
+		raw, err := ExtractBearerToken(c.GetHeader("Authorization"))
+		if err != nil {
 			c.Header("WWW-Authenticate", `Bearer realm="keycloak"`)
 			c.AbortWithStatusJSON(http.StatusUnauthorized, ErrorResponse{Error: "missing or malformed bearer token"})
 			return
@@ -71,8 +77,8 @@ func RequireClientRole(client, role string) gin.HandlerFunc {
 
 func requireRole(allowed func(*Claims) bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		claims, ok := GetClaims(c)
-		if !ok {
+		claims, err := GetClaims(c)
+		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, ErrorResponse{Error: "not authenticated"})
 			return
 		}
@@ -84,37 +90,37 @@ func requireRole(allowed func(*Claims) bool) gin.HandlerFunc {
 	}
 }
 
-// GetClaims returns the verified claims stored by [RequireAuth]. The boolean
-// is false if the request was not authenticated.
-func GetClaims(c *gin.Context) (*Claims, bool) {
+// GetClaims returns the verified claims stored by [RequireAuth], or
+// [ErrNoClaims] if the request was not authenticated.
+func GetClaims(c *gin.Context) (*Claims, error) {
 	v, ok := c.Get(ClaimsContextKey)
 	if !ok {
-		return nil, false
+		return nil, ErrNoClaims
 	}
 	claims, ok := v.(*Claims)
 	if !ok || claims == nil {
-		return nil, false
+		return nil, ErrNoClaims
 	}
-	return claims, true
+	return claims, nil
 }
 
 // GetUUID returns the authenticated user's Keycloak UUID (the token
-// subject). The boolean is false if the request was not authenticated.
-func GetUUID(c *gin.Context) (string, bool) {
-	claims, ok := GetClaims(c)
-	if !ok {
-		return "", false
+// subject), or [ErrNoClaims] if the request was not authenticated.
+func GetUUID(c *gin.Context) (string, error) {
+	claims, err := GetClaims(c)
+	if err != nil {
+		return "", err
 	}
-	return claims.UUID(), true
+	return claims.UUID(), nil
 }
 
-// GetRealmRoles returns the authenticated user's realm roles. The boolean is
-// false if the request was not authenticated. The slice is never nil when
-// the boolean is true.
-func GetRealmRoles(c *gin.Context) ([]string, bool) {
-	claims, ok := GetClaims(c)
-	if !ok {
-		return nil, false
+// GetRealmRoles returns the authenticated user's realm roles, or
+// [ErrNoClaims] if the request was not authenticated. The slice is never
+// nil on success.
+func GetRealmRoles(c *gin.Context) ([]string, error) {
+	claims, err := GetClaims(c)
+	if err != nil {
+		return nil, err
 	}
-	return claims.RealmRoles(), true
+	return claims.RealmRoles(), nil
 }

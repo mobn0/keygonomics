@@ -15,8 +15,8 @@
 //		log.Fatal(err)
 //	}
 //
-//	raw, ok := keygonomics.ExtractBearerToken(r.Header.Get("Authorization"))
-//	if !ok {
+//	raw, err := keygonomics.ExtractBearerToken(r.Header.Get("Authorization"))
+//	if err != nil {
 //		// no bearer token present
 //	}
 //

@@ -16,6 +16,10 @@ import (
 // method, or fails time-based validation.
 var ErrInvalidToken = errors.New("keygonomics: invalid token")
 
+// ErrMissingBearerToken is returned by [ExtractBearerToken] when the header
+// is absent, uses a scheme other than "Bearer", or carries an empty token.
+var ErrMissingBearerToken = errors.New("keygonomics: missing or malformed bearer token")
+
 // allowedSigningMethods lists the asymmetric algorithms accepted for
 // verification. Keycloak signs access tokens with RS256 by default but can be
 // configured to use other RSA, RSA-PSS, or ECDSA algorithms. Symmetric (HMAC)
@@ -193,18 +197,18 @@ func (v *Verifier) Verify(rawToken string) (*Claims, error) {
 
 // ExtractBearerToken extracts the token from an HTTP Authorization header
 // value of the form "Bearer <token>". The scheme is matched
-// case-insensitively, as required by RFC 6750. It returns the token and true
-// on success, or an empty string and false if the header is absent, uses a
+// case-insensitively, as required by RFC 6750. It returns the token on
+// success, or [ErrMissingBearerToken] if the header is absent, uses a
 // different scheme, or carries an empty token.
-func ExtractBearerToken(header string) (string, bool) {
+func ExtractBearerToken(header string) (string, error) {
 	const prefix = "bearer "
 	header = strings.TrimSpace(header)
 	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
-		return "", false
+		return "", ErrMissingBearerToken
 	}
 	token := strings.TrimSpace(header[len(prefix):])
 	if token == "" || strings.ContainsAny(token, " \t") {
-		return "", false
+		return "", ErrMissingBearerToken
 	}
-	return token, true
+	return token, nil
 }

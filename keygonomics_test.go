@@ -332,9 +332,13 @@ func TestExtractBearerToken(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := ExtractBearerToken(tt.header)
-			if ok != tt.wantOK || got != tt.want {
-				t.Errorf("ExtractBearerToken(%q) = (%q, %v), want (%q, %v)", tt.header, got, ok, tt.want, tt.wantOK)
+			got, err := ExtractBearerToken(tt.header)
+			gotOK := err == nil
+			if gotOK != tt.wantOK || got != tt.want {
+				t.Errorf("ExtractBearerToken(%q) = (%q, err=%v), want (%q, ok=%v)", tt.header, got, err, tt.want, tt.wantOK)
+			}
+			if !tt.wantOK && !errors.Is(err, ErrMissingBearerToken) {
+				t.Errorf("ExtractBearerToken(%q) error = %v, want ErrMissingBearerToken", tt.header, err)
 			}
 		})
 	}
