@@ -1,4 +1,4 @@
-package keygin_test
+package keygonomics_test
 
 import (
 	"crypto/rand"
@@ -15,7 +15,6 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/mobn0/keygonomics"
-	keygin "github.com/mobn0/keygonomics/gin"
 )
 
 const (
@@ -84,26 +83,26 @@ func (f *fixture) router() *gin.Engine {
 	r := gin.New()
 
 	r.GET("/public", func(c *gin.Context) {
-		_, ok := keygin.GetClaims(c)
+		_, ok := keygonomics.GetClaims(c)
 		c.JSON(http.StatusOK, gin.H{"authenticated": ok})
 	})
 
-	api := r.Group("/api", keygin.RequireAuth(f.verifier))
+	api := r.Group("/api", keygonomics.RequireAuth(f.verifier))
 	api.GET("/me", func(c *gin.Context) {
-		claims, _ := keygin.GetClaims(c)
-		uuid, _ := keygin.GetUUID(c)
-		roles, _ := keygin.GetRealmRoles(c)
+		claims, _ := keygonomics.GetClaims(c)
+		uuid, _ := keygonomics.GetUUID(c)
+		roles, _ := keygonomics.GetRealmRoles(c)
 		c.JSON(http.StatusOK, gin.H{
 			"uuid":     uuid,
 			"username": claims.PreferredUsername,
 			"roles":    roles,
 		})
 	})
-	api.GET("/admin", keygin.RequireRealmRole("admin"), okHandler)
-	api.GET("/writer", keygin.RequireClientRole("my-api", "writer"), okHandler)
+	api.GET("/admin", keygonomics.RequireRealmRole("admin"), okHandler)
+	api.GET("/writer", keygonomics.RequireClientRole("my-api", "writer"), okHandler)
 
 	// Role middleware wired without RequireAuth in front of it.
-	r.GET("/misconfigured", keygin.RequireRealmRole("admin"), okHandler)
+	r.GET("/misconfigured", keygonomics.RequireRealmRole("admin"), okHandler)
 
 	return r
 }
@@ -230,24 +229,24 @@ func TestAccessors(t *testing.T) {
 func TestAccessorsWithoutClaims(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 
-	if claims, ok := keygin.GetClaims(c); ok || claims != nil {
+	if claims, ok := keygonomics.GetClaims(c); ok || claims != nil {
 		t.Error("GetClaims on empty context should return (nil, false)")
 	}
-	if uuid, ok := keygin.GetUUID(c); ok || uuid != "" {
+	if uuid, ok := keygonomics.GetUUID(c); ok || uuid != "" {
 		t.Error("GetUUID on empty context should return (\"\", false)")
 	}
-	if roles, ok := keygin.GetRealmRoles(c); ok || roles != nil {
+	if roles, ok := keygonomics.GetRealmRoles(c); ok || roles != nil {
 		t.Error("GetRealmRoles on empty context should return (nil, false)")
 	}
 
 	// Wrong type stored under the key must not panic.
-	c.Set(keygin.ClaimsContextKey, "not claims")
-	if _, ok := keygin.GetClaims(c); ok {
+	c.Set(keygonomics.ClaimsContextKey, "not claims")
+	if _, ok := keygonomics.GetClaims(c); ok {
 		t.Error("GetClaims should reject a value of the wrong type")
 	}
 	var nilClaims *keygonomics.Claims
-	c.Set(keygin.ClaimsContextKey, nilClaims)
-	if _, ok := keygin.GetClaims(c); ok {
+	c.Set(keygonomics.ClaimsContextKey, nilClaims)
+	if _, ok := keygonomics.GetClaims(c); ok {
 		t.Error("GetClaims should reject a nil *Claims")
 	}
 }
@@ -256,7 +255,7 @@ func TestAbortStopsChain(t *testing.T) {
 	f := newFixture(t)
 	r := gin.New()
 	reached := false
-	r.GET("/x", keygin.RequireAuth(f.verifier), func(*gin.Context) { reached = true })
+	r.GET("/x", keygonomics.RequireAuth(f.verifier), func(*gin.Context) { reached = true })
 
 	if w := do(t, r, "/x", ""); w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d", w.Code)

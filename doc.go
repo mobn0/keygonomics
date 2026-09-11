@@ -1,16 +1,14 @@
-// Package keygonomics verifies Keycloak-issued JSON Web Tokens (JWTs) and
-// exposes their claims in a typed, convenient form.
+// Package keygonomics verifies Keycloak-issued JSON Web Tokens (JWTs),
+// exposes their claims in a typed form, and provides ready-to-use Gin
+// middleware for protecting routes.
 //
-// The package is framework-agnostic: it knows nothing about HTTP routers or
-// middleware. It fetches and caches the realm's JSON Web Key Set (JWKS),
-// verifies a token's signature and time-based claims, and parses the
-// Keycloak-specific claims (preferred_username, email, realm_access,
-// resource_access) into a [Claims] value.
+// # Core
 //
-// Framework adapters live in subpackages. The Gin adapter is in
-// github.com/mobn0/keygonomics/gin.
-//
-// # Usage
+// The core API is framework-agnostic. [Verifier] fetches and caches the
+// realm's JSON Web Key Set (JWKS), verifies a token's signature and
+// time-based claims, and parses the Keycloak-specific claims
+// (preferred_username, email, realm_access, resource_access) into a
+// [Claims] value.
 //
 //	v, err := keygonomics.NewFromIssuer("https://sso.example.com/realms/myrealm")
 //	if err != nil {
@@ -31,6 +29,21 @@
 //	if claims.HasRealmRole("admin") {
 //		// ...
 //	}
+//
+// # Gin middleware
+//
+// Attach [RequireAuth] to a router or group to reject requests without a
+// valid bearer token. Chain [RequireRealmRole] or [RequireClientRole] after
+// it to restrict access by Keycloak role. Inside handlers, use [GetClaims],
+// [GetUUID], and [GetRealmRoles] to read the authenticated user's identity.
+//
+//	r := gin.Default()
+//	api := r.Group("/api", keygonomics.RequireAuth(v))
+//	api.GET("/me", func(c *gin.Context) {
+//		uuid, _ := keygonomics.GetUUID(c)
+//		c.JSON(http.StatusOK, gin.H{"uuid": uuid})
+//	})
+//	api.GET("/admin", keygonomics.RequireRealmRole("admin"), adminHandler)
 //
 // # Realm roles vs. client roles
 //

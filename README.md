@@ -13,14 +13,7 @@ If your Go service sits behind Keycloak, every request arrives with a bearer tok
 
 `keygonomics` answers all three in a few lines. It fetches and caches your realm's public keys (JWKS), verifies the token signature and expiry, and hands you a typed `Claims` struct with helpers for the user UUID and for realm and client roles.
 
-The package is split in two:
-
-| Package | Import path | Purpose |
-| --- | --- | --- |
-| `keygonomics` | `github.com/mobn0/keygonomics` | Framework-agnostic core: JWKS caching, verification, claims parsing. |
-| `keygin` | `github.com/mobn0/keygonomics/gin` | Gin middleware and context helpers built on the core. |
-
-The core has no dependency on Gin, so it can be used with `net/http` or any other router. More adapters may follow.
+Everything lives in a single package: the core verification API (JWKS caching, signature checks, claims parsing) and the Gin middleware built on top of it. The core functions don't touch Gin, so they work just as well with `net/http` or any other router.
 
 ## Installation
 
@@ -28,7 +21,7 @@ The core has no dependency on Gin, so it can be used with `net/http` or any othe
 go get github.com/mobn0/keygonomics
 ```
 
-The Gin adapter lives in the same module, so the command above installs both. Requires Go 1.27 or newer.
+Requires Go 1.27 or newer.
 
 ## Quick start
 
@@ -42,7 +35,6 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/mobn0/keygonomics"
-	keygin "github.com/mobn0/keygonomics/gin"
 )
 
 func main() {
@@ -56,11 +48,11 @@ func main() {
 	r := gin.Default()
 
 	// 2. Require a valid token for everything under /api.
-	api := r.Group("/api", keygin.RequireAuth(verifier))
+	api := r.Group("/api", keygonomics.RequireAuth(verifier))
 
 	// 3. Read the user's identity inside a handler.
 	api.GET("/me", func(c *gin.Context) {
-		claims, _ := keygin.GetClaims(c)
+		claims, _ := keygonomics.GetClaims(c)
 		c.JSON(http.StatusOK, gin.H{
 			"uuid":     claims.UUID(),
 			"username": claims.PreferredUsername,
@@ -69,13 +61,13 @@ func main() {
 	})
 
 	// 4. Restrict a route to a realm role...
-	api.GET("/admin", keygin.RequireRealmRole("admin"), func(c *gin.Context) {
-		uuid, _ := keygin.GetUUID(c)
+	api.GET("/admin", keygonomics.RequireRealmRole("admin"), func(c *gin.Context) {
+		uuid, _ := keygonomics.GetUUID(c)
 		c.JSON(http.StatusOK, gin.H{"admin": uuid})
 	})
 
 	// ...or to a role defined on a specific client.
-	api.GET("/reports", keygin.RequireClientRole("reporting-api", "reports:read"), func(c *gin.Context) {
+	api.GET("/reports", keygonomics.RequireClientRole("reporting-api", "reports:read"), func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"reports": []string{}})
 	})
 
@@ -127,11 +119,9 @@ If you already have the JWKS URL, or need custom refresh intervals or HTTP clien
 
 ## API reference
 
-Every exported symbol, with a minimal example. Full signatures are on [pkg.go.dev](https://pkg.go.dev/github.com/mobn0/keygonomics).
+Every exported symbol in `github.com/mobn0/keygonomics`, with a minimal example. Full signatures are on [pkg.go.dev](https://pkg.go.dev/github.com/mobn0/keygonomics).
 
-### Package `keygonomics` (core)
-
-Import: `github.com/mobn0/keygonomics`
+### Core
 
 #### `Verifier`
 
@@ -305,25 +295,21 @@ All roles for one client. Never returns `nil`; an unknown client gives an empty 
 roles := claims.ClientRoles("reporting-api") // e.g. ["reports:read"], or [] if none
 ```
 
-### Package `keygin` (Gin adapter)
-
-Import: `keygin "github.com/mobn0/keygonomics/gin"`
-
-The import alias is needed because the directory is named `gin`, which would collide with `github.com/gin-gonic/gin`.
+### Gin middleware
 
 #### `RequireAuth(v *keygonomics.Verifier) gin.HandlerFunc`
 
 The authentication middleware. Reads the `Authorization` header, verifies the token, and stores the claims in the Gin context. Aborts with `401` and a JSON error body if anything is wrong. Attach it to a group so every route beneath it is protected.
 
 ```go
-api := r.Group("/api", keygin.RequireAuth(verifier))
+api := r.Group("/api", keygonomics.RequireAuth(verifier))
 api.GET("/me", meHandler) // only reached with a valid token
 ```
 
 You can also attach it to a single route:
 
 ```go
-r.GET("/me", keygin.RequireAuth(verifier), meHandler)
+r.GET("/me", keygonomics.RequireAuth(verifier), meHandler)
 ```
 
 #### `RequireRealmRole(role string) gin.HandlerFunc`
@@ -331,10 +317,10 @@ r.GET("/me", keygin.RequireAuth(verifier), meHandler)
 Authorization middleware. Must come after `RequireAuth`. Aborts with `403` if the user lacks the realm role, or `401` if no claims are present (which means `RequireAuth` didn't run).
 
 ```go
-api.GET("/admin", keygin.RequireRealmRole("admin"), adminHandler)
+api.GET("/admin", keygonomics.RequireRealmRole("admin"), adminHandler)
 
 // Or for a whole group:
-admin := api.Group("/admin", keygin.RequireRealmRole("admin"))
+admin := api.Group("/admin", keygonomics.RequireRealmRole("admin"))
 admin.GET("/users", listUsers)
 admin.DELETE("/users/:id", deleteUser)
 ```
@@ -344,7 +330,7 @@ admin.DELETE("/users/:id", deleteUser)
 Same as `RequireRealmRole` but checks a client role. `client` is the Keycloak client ID.
 
 ```go
-api.GET("/reports", keygin.RequireClientRole("reporting-api", "reports:read"), reportsHandler)
+api.GET("/reports", keygonomics.RequireClientRole("reporting-api", "reports:read"), reportsHandler)
 ```
 
 #### `GetClaims(c *gin.Context) (*keygonomics.Claims, bool)`
@@ -353,7 +339,7 @@ Returns the full claims stored by `RequireAuth`. The boolean is `false` on route
 
 ```go
 func meHandler(c *gin.Context) {
-	claims, _ := keygin.GetClaims(c)
+	claims, _ := keygonomics.GetClaims(c)
 	c.JSON(http.StatusOK, gin.H{
 		"uuid":  claims.UUID(),
 		"email": claims.Email,
@@ -365,7 +351,7 @@ On a route that is optionally authenticated, check the boolean:
 
 ```go
 r.GET("/greeting", func(c *gin.Context) {
-	if claims, ok := keygin.GetClaims(c); ok {
+	if claims, ok := keygonomics.GetClaims(c); ok {
 		c.String(http.StatusOK, "hello, "+claims.PreferredUsername)
 		return
 	}
@@ -379,7 +365,7 @@ Shortcut for `GetClaims(c)` followed by `.UUID()`. Handy when all you need is th
 
 ```go
 func createOrder(c *gin.Context) {
-	userID, _ := keygin.GetUUID(c)
+	userID, _ := keygonomics.GetUUID(c)
 	order := db.CreateOrder(userID, ...)
 	c.JSON(http.StatusCreated, order)
 }
@@ -390,7 +376,7 @@ func createOrder(c *gin.Context) {
 Shortcut for `GetClaims(c)` followed by `.RealmRoles()`. The slice is never `nil` when the boolean is `true`.
 
 ```go
-roles, _ := keygin.GetRealmRoles(c)
+roles, _ := keygonomics.GetRealmRoles(c)
 c.JSON(http.StatusOK, gin.H{"roles": roles})
 ```
 
@@ -399,7 +385,7 @@ c.JSON(http.StatusOK, gin.H{"roles": roles})
 The string key under which `RequireAuth` stores the claims via `c.Set`. Exported so you can read the value with `c.Get` or `c.MustGet` if you prefer, but `GetClaims` does the type assertion for you and is the recommended way.
 
 ```go
-claims := c.MustGet(keygin.ClaimsContextKey).(*keygonomics.Claims)
+claims := c.MustGet(keygonomics.ClaimsContextKey).(*keygonomics.Claims)
 ```
 
 #### `ErrorResponse`
@@ -407,7 +393,7 @@ claims := c.MustGet(keygin.ClaimsContextKey).(*keygonomics.Claims)
 The JSON body sent on `401` and `403`. It has a single `error` field with a short, stable message. Exported so clients and tests can decode it.
 
 ```go
-var body keygin.ErrorResponse
+var body keygonomics.ErrorResponse
 json.Unmarshal(w.Body.Bytes(), &body)
 fmt.Println(body.Error) // "invalid token"
 ```
@@ -422,7 +408,7 @@ Keycloak has two kinds of roles, and they show up in different places in the tok
 "realm_access": { "roles": ["admin", "offline_access", "uma_authorization"] }
 ```
 
-Check them with `claims.HasRealmRole("admin")` or `keygin.RequireRealmRole("admin")`.
+Check them with `claims.HasRealmRole("admin")` or `keygonomics.RequireRealmRole("admin")`.
 
 **Client roles** are defined on a specific client (Clients → *your client* → Roles) and are scoped to that client. They appear under `resource_access`, keyed by the client ID:
 
@@ -433,7 +419,7 @@ Check them with `claims.HasRealmRole("admin")` or `keygin.RequireRealmRole("admi
 }
 ```
 
-Check them with `claims.HasClientRole("reporting-api", "reports:read")` or `keygin.RequireClientRole("reporting-api", "reports:read")`. The first argument is the **client ID** as shown in the Keycloak admin console, not the client's display name or its internal UUID.
+Check them with `claims.HasClientRole("reporting-api", "reports:read")` or `keygonomics.RequireClientRole("reporting-api", "reports:read")`. The first argument is the **client ID** as shown in the Keycloak admin console, not the client's display name or its internal UUID.
 
 Two common surprises:
 

@@ -19,7 +19,6 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/mobn0/keygonomics"
-	keygin "github.com/mobn0/keygonomics/gin"
 )
 
 func main() {
@@ -47,11 +46,11 @@ func main() {
 	})
 
 	// Everything under /api requires a valid Keycloak token.
-	api := r.Group("/api", keygin.RequireAuth(verifier))
+	api := r.Group("/api", keygonomics.RequireAuth(verifier))
 
 	// Any authenticated user can see their own identity.
 	api.GET("/me", func(c *gin.Context) {
-		claims, _ := keygin.GetClaims(c)
+		claims, _ := keygonomics.GetClaims(c)
 		c.JSON(http.StatusOK, gin.H{
 			"uuid":        claims.UUID(),
 			"username":    claims.PreferredUsername,
@@ -61,14 +60,14 @@ func main() {
 	})
 
 	// Only users with the "admin" realm role.
-	api.GET("/admin", keygin.RequireRealmRole("admin"), func(c *gin.Context) {
-		uuid, _ := keygin.GetUUID(c)
+	api.GET("/admin", keygonomics.RequireRealmRole("admin"), func(c *gin.Context) {
+		uuid, _ := keygonomics.GetUUID(c)
 		c.JSON(http.StatusOK, gin.H{"message": "hello, admin " + uuid})
 	})
 
 	// Only users with the "reports:read" role on the "reporting-api" client.
-	api.GET("/reports", keygin.RequireClientRole("reporting-api", "reports:read"), func(c *gin.Context) {
-		roles, _ := keygin.GetRealmRoles(c)
+	api.GET("/reports", keygonomics.RequireClientRole("reporting-api", "reports:read"), func(c *gin.Context) {
+		roles, _ := keygonomics.GetRealmRoles(c)
 		c.JSON(http.StatusOK, gin.H{"reports": []string{}, "your_realm_roles": roles})
 	})
 
