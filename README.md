@@ -3,17 +3,9 @@
 [![CI](https://github.com/mobn0/keygonomics/actions/workflows/ci.yml/badge.svg)](https://github.com/mobn0/keygonomics/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/mobn0/keygonomics.svg)](https://pkg.go.dev/github.com/mobn0/keygonomics)
 
-Keycloak JWT verification for Go, with ready-made [Gin](https://github.com/gin-gonic/gin) middleware.
+Keycloak JWT middleware for [Gin](https://github.com/gin-gonic/gin).
 
-If your Go service sits behind Keycloak, every request arrives with a bearer token and you need to answer three questions before doing anything else:
-
-1. Is this token genuine and still valid?
-2. Who is the user? (Keycloak's user ID is the token's `sub` claim, a UUID.)
-3. What roles do they have, so I can allow or deny this route?
-
-`keygonomics` answers all three in a few lines. It fetches and caches your realm's public keys (JWKS), verifies the token signature and expiry, and hands you a typed `Claims` struct with helpers for the user UUID and for realm and client roles.
-
-Everything lives in a single package: the core verification API (JWKS caching, signature checks, claims parsing) and the Gin middleware built on top of it. The core functions don't touch Gin, so they work just as well with `net/http` or any other router.
+It verifies the bearer token on each request against your realm's public keys, rejects anything invalid or expired, and gives your handlers the user's UUID and roles. Routes can be restricted to a realm role or a client role with one line.
 
 ## Installation
 
@@ -23,65 +15,108 @@ go get github.com/mobn0/keygonomics
 
 Requires Go 1.27 or newer.
 
-## Quick start
+## Setup guide
+
+### 1. Find your realm's issuer URL
+
+In the Keycloak admin console, open your realm and go to **Realm settings → General → Endpoints → OpenID Endpoint Configuration**. The JSON shown there has an `issuer` field. It looks like:
+
+```
+https://sso.example.com/realms/myrealm
+```
+
+This is the only piece of configuration the package needs. It is also the value of the `iss` claim in every token the realm issues, so you can copy it from a decoded token instead.
+
+### 2. Create a Verifier at startup
+
+The verifier downloads the realm's signing keys once and refreshes them in the background. Create it once and share it across all handlers.
 
 ```go
-package main
-
-import (
-	"log"
-	"net/http"
-
-	"github.com/gin-gonic/gin"
-
-	"github.com/mobn0/keygonomics"
-)
-
-func main() {
-	// 1. Create a Verifier for your realm. This fetches the JWKS once and
-	//    refreshes it in the background, so create it once and reuse it.
-	verifier, err := keygonomics.NewFromIssuer("https://sso.example.com/realms/myrealm")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	r := gin.Default()
-
-	// 2. Require a valid token for everything under /api.
-	api := r.Group("/api", keygonomics.RequireAuth(verifier))
-
-	// 3. Read the user's identity inside a handler.
-	api.GET("/me", func(c *gin.Context) {
-		claims, _ := keygonomics.GetClaims(c)
-		c.JSON(http.StatusOK, gin.H{
-			"uuid":     claims.UUID(),
-			"username": claims.PreferredUsername,
-			"roles":    claims.RealmRoles(),
-		})
-	})
-
-	// 4. Restrict a route to a realm role...
-	api.GET("/admin", keygonomics.RequireRealmRole("admin"), func(c *gin.Context) {
-		uuid, _ := keygonomics.GetUUID(c)
-		c.JSON(http.StatusOK, gin.H{"admin": uuid})
-	})
-
-	// ...or to a role defined on a specific client.
-	api.GET("/reports", keygonomics.RequireClientRole("reporting-api", "reports:read"), func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"reports": []string{}})
-	})
-
-	log.Fatal(r.Run(":8080"))
+verifier, err := keygonomics.NewFromIssuer("https://sso.example.com/realms/myrealm")
+if err != nil {
+	log.Fatalf("keycloak: %v", err)
 }
 ```
 
-A complete runnable version is in [examples/gin/main.go](examples/gin/main.go):
+If this fails, the JWKS endpoint could not be reached. Check the URL, network access from your service to Keycloak, and TLS certificates.
+
+### 3. Protect your routes
+
+Attach `RequireAuth` to a router group. Every route in the group now requires a valid token and responds with `401` otherwise.
+
+```go
+r := gin.Default()
+
+api := r.Group("/api", keygonomics.RequireAuth(verifier))
+```
+
+Routes registered on `r` directly stay public.
+
+### 4. Read the user inside a handler
+
+`RequireAuth` stores the verified claims in the Gin context. Use the helpers to read them.
+
+```go
+api.GET("/me", func(c *gin.Context) {
+	claims, _ := keygonomics.GetClaims(c)
+	c.JSON(http.StatusOK, gin.H{
+		"uuid":     claims.UUID(),
+		"username": claims.PreferredUsername,
+		"email":    claims.Email,
+		"roles":    claims.RealmRoles(),
+	})
+})
+```
+
+`claims.UUID()` is Keycloak's user ID. Use it as the key for anything you store about the user.
+
+### 5. Restrict routes by role
+
+Chain a role middleware after `RequireAuth`. Users without the role get `403`.
+
+```go
+// Realm role
+api.GET("/admin", keygonomics.RequireRealmRole("admin"), adminHandler)
+
+// Client role: first argument is the client ID, second is the role
+api.GET("/reports", keygonomics.RequireClientRole("reporting-api", "reports:read"), reportsHandler)
+```
+
+Or restrict a whole group:
+
+```go
+admin := api.Group("/admin", keygonomics.RequireRealmRole("admin"))
+admin.GET("/users", listUsers)
+admin.DELETE("/users/:id", deleteUser)
+```
+
+Not sure whether you need a realm role or a client role? See [Realm roles vs. client roles](#realm-roles-vs-client-roles).
+
+### 6. Run and test it
+
+Put it together and start the server:
+
+```go
+log.Fatal(r.Run(":8080"))
+```
+
+Get a token from Keycloak (the password grant is the quickest way to test, if it's enabled on your client):
+
+```sh
+TOKEN=$(curl -s -X POST "https://sso.example.com/realms/myrealm/protocol/openid-connect/token" \
+  -d grant_type=password -d client_id=my-client -d username=alice -d password=secret \
+  | jq -r .access_token)
+
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/me
+```
+
+A complete runnable app is in [examples/gin/main.go](examples/gin/main.go):
 
 ```sh
 KEYCLOAK_ISSUER=https://sso.example.com/realms/myrealm go run ./examples/gin
 ```
 
-### Responses
+### Error responses
 
 | Situation | Status | Body |
 | --- | --- | --- |
@@ -90,38 +125,11 @@ KEYCLOAK_ISSUER=https://sso.example.com/realms/myrealm go run ./examples/gin
 | Token is valid but lacks the required role | `403` | `{"error":"insufficient role"}` |
 | Role middleware used without `RequireAuth` in front of it | `401` | `{"error":"not authenticated"}` |
 
-`401` responses also carry a `WWW-Authenticate: Bearer ...` header.
-
-## Using the core without Gin
-
-```go
-verifier, err := keygonomics.NewFromIssuer("https://sso.example.com/realms/myrealm")
-if err != nil {
-	log.Fatal(err)
-}
-
-http.HandleFunc("/me", func(w http.ResponseWriter, r *http.Request) {
-	raw, ok := keygonomics.ExtractBearerToken(r.Header.Get("Authorization"))
-	if !ok {
-		http.Error(w, "missing bearer token", http.StatusUnauthorized)
-		return
-	}
-	claims, err := verifier.Verify(raw)
-	if err != nil {
-		http.Error(w, "invalid token", http.StatusUnauthorized)
-		return
-	}
-	fmt.Fprintln(w, "hello", claims.UUID())
-})
-```
-
-If you already have the JWKS URL, or need custom refresh intervals or HTTP clients, use `keygonomics.New(jwksURL)` or build a [keyfunc](https://github.com/MicahParks/keyfunc) yourself and pass it to `keygonomics.NewWithKeyfunc`.
-
 ## API reference
 
 Every exported symbol in `github.com/mobn0/keygonomics`, with a minimal example. Full signatures are on [pkg.go.dev](https://pkg.go.dev/github.com/mobn0/keygonomics).
 
-### Core
+### Verification
 
 #### `Verifier`
 
@@ -295,7 +303,7 @@ All roles for one client. Never returns `nil`; an unknown client gives an empty 
 roles := claims.ClientRoles("reporting-api") // e.g. ["reports:read"], or [] if none
 ```
 
-### Gin middleware
+### Middleware and handler helpers
 
 #### `RequireAuth(v *keygonomics.Verifier) gin.HandlerFunc`
 
@@ -304,12 +312,6 @@ The authentication middleware. Reads the `Authorization` header, verifies the to
 ```go
 api := r.Group("/api", keygonomics.RequireAuth(verifier))
 api.GET("/me", meHandler) // only reached with a valid token
-```
-
-You can also attach it to a single route:
-
-```go
-r.GET("/me", keygonomics.RequireAuth(verifier), meHandler)
 ```
 
 #### `RequireRealmRole(role string) gin.HandlerFunc`
@@ -345,18 +347,6 @@ func meHandler(c *gin.Context) {
 		"email": claims.Email,
 	})
 }
-```
-
-On a route that is optionally authenticated, check the boolean:
-
-```go
-r.GET("/greeting", func(c *gin.Context) {
-	if claims, ok := keygonomics.GetClaims(c); ok {
-		c.String(http.StatusOK, "hello, "+claims.PreferredUsername)
-		return
-	}
-	c.String(http.StatusOK, "hello, stranger")
-})
 ```
 
 #### `GetUUID(c *gin.Context) (string, bool)`
@@ -428,10 +418,10 @@ Two common surprises:
 
 ## Security notes
 
-- Only asymmetric signing algorithms (RS*, PS*, ES*, EdDSA) are accepted. HMAC tokens are rejected outright, which prevents key-confusion attacks against the public JWKS.
+- Only asymmetric signing algorithms (RS*, PS*, ES*, EdDSA) are accepted. HMAC tokens are rejected, which prevents key-confusion attacks against the public JWKS.
 - Tokens without an `exp` claim are rejected.
-- The JWKS is refreshed hourly and on encountering an unknown key ID (rate limited), so key rotation in Keycloak is picked up automatically.
-- This package verifies tokens; it does not check the `iss` or `aud` claims. If your service must only accept tokens for a specific audience, check `claims.Audience` in a handler or a small middleware of your own.
+- Signing keys are refreshed hourly and on encountering an unknown key ID, so key rotation in Keycloak is picked up automatically.
+- The `iss` and `aud` claims are not checked. If your service must only accept tokens for a specific audience, check `claims.Audience` in a small middleware of your own.
 
 ## License
 
