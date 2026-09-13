@@ -3,9 +3,9 @@
 [![CI](https://github.com/mobn0/keygonomics/actions/workflows/ci.yml/badge.svg)](https://github.com/mobn0/keygonomics/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/mobn0/keygonomics.svg)](https://pkg.go.dev/github.com/mobn0/keygonomics)
 
-Keycloak JWT middleware for [Gin](https://github.com/gin-gonic/gin).
+Keycloak client and JWT middleware for [Gin](https://github.com/gin-gonic/gin).
 
-It verifies the bearer token on each request against your realm's public keys, rejects anything invalid or expired, and gives your handlers the user's UUID and roles. Routes can be restricted to a realm role or a client role with one line.
+One `Client` does two jobs. It verifies the bearer token on each request against your realm's public keys, rejects anything invalid or expired, and gives your handlers the user's UUID and roles; routes can be restricted to a realm role or a client role with one line. It also talks to the Keycloak Admin REST API with your service's own credentials, so your server can list every user in the realm with their roles and grant or revoke realm roles.
 
 ## Installation
 
@@ -25,34 +25,47 @@ In the Keycloak admin console, open your realm and go to **Realm settings → Ge
 https://sso.example.com/realms/myrealm
 ```
 
-This is the only piece of configuration the package needs. It is also the value of the `iss` claim in every token the realm issues, so you can copy it from a decoded token instead.
+It is also the value of the `iss` claim in every token the realm issues, so you can copy it from a decoded token instead.
 
-### 2. Create a Verifier at startup
+### 2. Create a client for your service
 
-The verifier downloads the realm's signing keys once and refreshes them in the background. Create it once and share it across all handlers.
+Your server needs its own identity in Keycloak to call the Admin REST API. In the admin console go to **Clients → Create client**:
+
+- **Client authentication**: on (this makes it a confidential client with a secret)
+- **Service accounts roles**: on
+
+Save it, then open the **Service accounts roles** tab and assign the `realm-management` client roles `view-users` (to list users) and `manage-users` (to change roles). Copy the client ID and the secret from the **Credentials** tab.
+
+### 3. Create the Client at startup
+
+The client downloads the realm's signing keys once and refreshes them in the background, and fetches a service-account token the first time it talks to the Admin API. Create it once and share it across all handlers.
 
 ```go
-verifier, err := keygonomics.NewFromIssuer("https://sso.example.com/realms/myrealm")
+kc, err := keygonomics.New(keygonomics.Config{
+	Issuer:       "https://sso.example.com/realms/myrealm",
+	ClientID:     "my-backend",
+	ClientSecret: os.Getenv("KEYCLOAK_CLIENT_SECRET"),
+})
 if err != nil {
 	log.Fatalf("keycloak: %v", err)
 }
 ```
 
-If this fails, the JWKS endpoint could not be reached. Check the URL, network access from your service to Keycloak, and TLS certificates.
+If this fails, the JWKS endpoint could not be reached. Check the issuer URL, network access from your service to Keycloak, and TLS certificates. Bad client credentials are not detected here; they surface as an error from the first Admin API call.
 
-### 3. Protect your routes
+### 4. Protect your routes
 
 Attach `RequireAuth` to a router group. Every route in the group now requires a valid token and responds with `401` otherwise.
 
 ```go
 r := gin.Default()
 
-api := r.Group("/api", keygonomics.RequireAuth(verifier))
+api := r.Group("/api", keygonomics.RequireAuth(kc))
 ```
 
 Routes registered on `r` directly stay public.
 
-### 4. Read the user inside a handler
+### 5. Read the user inside a handler
 
 `RequireAuth` stores the verified claims in the Gin context. Use the helpers to read them.
 
@@ -70,7 +83,7 @@ api.GET("/me", func(c *gin.Context) {
 
 `claims.UUID()` is Keycloak's user ID. Use it as the key for anything you store about the user.
 
-### 5. Restrict routes by role
+### 6. Restrict routes by role
 
 Chain a role middleware after `RequireAuth`. Users without the role get `403`.
 
@@ -92,7 +105,38 @@ admin.DELETE("/users/:id", deleteUser)
 
 Not sure whether you need a realm role or a client role? See [Realm roles vs. client roles](#realm-roles-vs-client-roles).
 
-### 6. Run and test it
+### 7. Manage users and roles
+
+The same client lists every user in the realm with their realm roles, and grants or revokes a realm role. These calls use your service's credentials from step 2, not the calling user's token, so guard the routes that expose them.
+
+```go
+admin := api.Group("/admin", keygonomics.RequireRealmRole("admin"))
+
+admin.GET("/users", func(c *gin.Context) {
+	users, err := kc.ListUsers(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "keycloak unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, users)
+})
+
+admin.PUT("/users/:id/roles/:role", func(c *gin.Context) {
+	err := kc.AssignRealmRole(c.Request.Context(), c.Param("id"), c.Param("role"))
+	switch {
+	case err == nil:
+		c.Status(http.StatusNoContent)
+	case errors.Is(err, keygonomics.ErrRoleNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "role not found"})
+	default:
+		c.JSON(http.StatusBadGateway, gin.H{"error": "keycloak unavailable"})
+	}
+})
+```
+
+`RemoveRealmRole` has the same shape as `AssignRealmRole`.
+
+### 8. Run and test it
 
 Put it together and start the server:
 
@@ -113,7 +157,10 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/me
 A complete runnable app is in [examples/gin/main.go](examples/gin/main.go):
 
 ```sh
-KEYCLOAK_ISSUER=https://sso.example.com/realms/myrealm go run ./examples/gin
+KEYCLOAK_ISSUER=https://sso.example.com/realms/myrealm \
+KEYCLOAK_CLIENT_ID=my-backend \
+KEYCLOAK_CLIENT_SECRET=... \
+go run ./examples/gin
 ```
 
 ### Error responses
@@ -129,75 +176,83 @@ KEYCLOAK_ISSUER=https://sso.example.com/realms/myrealm go run ./examples/gin
 
 Every exported symbol in `github.com/mobn0/keygonomics`, with a minimal example. Full signatures are on [pkg.go.dev](https://pkg.go.dev/github.com/mobn0/keygonomics).
 
-### Verification
+### Client
 
-#### `Verifier`
+#### `Client`
 
-Verifies Keycloak tokens against a realm's JWKS. Safe for concurrent use. Create one at startup and share it; it caches the keys and refreshes them in the background.
+Verifies Keycloak tokens against a realm's JWKS and calls the Admin REST API. Safe for concurrent use. Create one at startup and share it; it caches the signing keys and refreshes them in the background, and caches the service-account token until shortly before it expires.
 
 ```go
-var verifier *keygonomics.Verifier // created once, used by every handler
+var kc *keygonomics.Client // created once, used by every handler
 ```
 
-#### `NewFromIssuer(issuerURL string) (*Verifier, error)`
+#### `Config`
 
-The usual constructor. Takes the realm's issuer URL (the same value as the `iss` claim in your tokens) and derives the JWKS endpoint from it.
+Everything `New` needs.
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `Issuer` | yes | Realm issuer URL, e.g. `https://sso.example.com/realms/myrealm`. The base URL and realm name are derived from it. |
+| `ClientID`, `ClientSecret` | yes | Credentials of a confidential client with service accounts enabled (see [setup step 2](#2-create-a-client-for-your-service)). |
+| `HTTPClient` | no | Used for Admin API and token requests. Defaults to `http.DefaultClient`. |
+| `Keyfunc` | no | A [keyfunc](https://github.com/MicahParks/keyfunc) to verify signatures with instead of fetching the JWKS. For custom refresh intervals, several JWKS URLs, or a static key set in tests. |
+
+#### `New(cfg Config) (*Client, error)`
+
+The constructor. Fetches the JWKS immediately (unless `cfg.Keyfunc` is set) and fails if it cannot be reached.
 
 ```go
-verifier, err := keygonomics.NewFromIssuer("https://sso.example.com/realms/myrealm")
+kc, err := keygonomics.New(keygonomics.Config{
+	Issuer:       "https://sso.example.com/realms/myrealm",
+	ClientID:     "my-backend",
+	ClientSecret: secret,
+})
 if err != nil {
-	log.Fatal(err) // JWKS could not be fetched: wrong URL, realm down, TLS problem
+	log.Fatal(err) // bad issuer, or JWKS could not be fetched: realm down, TLS problem
 }
 ```
 
-#### `New(jwksURL string) (*Verifier, error)`
+#### `NewContext(ctx context.Context, cfg Config) (*Client, error)`
 
-Same as `NewFromIssuer`, but you give the JWKS URL directly. Useful if your Keycloak sits behind a proxy that rewrites paths.
-
-```go
-verifier, err := keygonomics.New("https://sso.example.com/realms/myrealm/protocol/openid-connect/certs")
-```
-
-#### `NewContext` / `NewFromIssuerContext`
-
-Context-aware versions of `New` and `NewFromIssuer`. The background JWKS refresh goroutine stops when the context is cancelled. Use these if you shut the service down gracefully or create verifiers in tests.
+Same as `New`, but the background JWKS refresh goroutine stops when the context is cancelled. Use it if you shut the service down gracefully or create clients in tests.
 
 ```go
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel() // stops the refresh goroutine
 
-verifier, err := keygonomics.NewFromIssuerContext(ctx, "https://sso.example.com/realms/myrealm")
+kc, err := keygonomics.NewContext(ctx, cfg)
 ```
 
-#### `NewWithKeyfunc(kf keyfunc.Keyfunc) *Verifier`
-
-Wraps an existing [keyfunc](https://github.com/MicahParks/keyfunc) you built yourself. Reach for this when you need a custom refresh interval, HTTP client, several JWKS URLs, or a static key set in tests.
+Using a static key set in tests:
 
 ```go
-kf, err := keyfunc.NewDefaultOverrideCtx(ctx, []string{jwksURL}, keyfunc.Override{
-	RefreshInterval: 5 * time.Minute,
-})
+kf, err := keyfunc.NewJWKSetJSON(jwksJSON)
 if err != nil {
 	log.Fatal(err)
 }
-verifier := keygonomics.NewWithKeyfunc(kf)
+kc, err := keygonomics.New(keygonomics.Config{
+	Issuer: "https://sso.example.com/realms/test", ClientID: "x", ClientSecret: "y",
+	Keyfunc: kf,
+})
 ```
 
 #### `JWKSURL(issuerURL string) string`
 
-Pure helper that turns an issuer URL into the JWKS URL. Trailing slashes are stripped. `NewFromIssuer` uses it internally.
+Pure helper that turns an issuer URL into the JWKS URL. Trailing slashes are stripped. `New` uses it internally.
 
 ```go
 u := keygonomics.JWKSURL("https://sso.example.com/realms/myrealm/")
 // "https://sso.example.com/realms/myrealm/protocol/openid-connect/certs"
 ```
 
-#### `(*Verifier).Verify(rawToken string) (*Claims, error)`
+### Verification
+
+#### `(*Client).Verify(rawToken string) (*Claims, error)`
 
 Parses a raw JWT, checks the signature against the JWKS, and validates `exp`, `nbf`, and `iat`. Returns the parsed claims or an error wrapping `ErrInvalidToken`.
 
 ```go
-claims, err := verifier.Verify(rawToken)
+claims, err := kc.Verify(rawToken)
 if err != nil {
 	// expired, bad signature, unknown key, HMAC, missing exp, garbage...
 	return
@@ -307,14 +362,75 @@ All roles for one client. Never returns `nil`; an unknown client gives an empty 
 roles := claims.ClientRoles("reporting-api") // e.g. ["reports:read"], or [] if none
 ```
 
+### Users and roles
+
+These methods call the Keycloak Admin REST API as your service's own account. They need the realm-management roles described in [setup step 2](#2-create-a-client-for-your-service); a missing role shows up as a `403` wrapped in `ErrAdminRequestFailed`.
+
+#### `(*Client).ListUsers(ctx context.Context) ([]User, error)`
+
+Every user in the realm with the realm roles mapped directly to them. Pages through Keycloak internally; the returned slice is never `nil`.
+
+```go
+users, err := kc.ListUsers(ctx)
+for _, u := range users {
+	fmt.Println(u.ID, u.Username, u.Enabled, u.RealmRoles)
+}
+```
+
+#### `(*Client).AssignRealmRole(ctx context.Context, userID, role string) error`
+
+Grants a realm role to a user. `userID` is the Keycloak UUID (the same value as `claims.UUID()`); `role` is the role name. Idempotent: assigning a role the user already has is not an error. Returns an error wrapping `ErrRoleNotFound` if no such realm role exists.
+
+```go
+if err := kc.AssignRealmRole(ctx, userID, "editor"); err != nil {
+	if errors.Is(err, keygonomics.ErrRoleNotFound) {
+		// no realm role called "editor"
+	}
+}
+```
+
+#### `(*Client).RemoveRealmRole(ctx context.Context, userID, role string) error`
+
+Revokes a realm role from a user. Same arguments and errors as `AssignRealmRole`. Removing a role the user does not have is not an error.
+
+```go
+err := kc.RemoveRealmRole(ctx, userID, "editor")
+```
+
+#### `User`
+
+One entry from `ListUsers`.
+
+| Field | JSON | Type |
+| --- | --- | --- |
+| `ID` | `id` | `string` — the Keycloak UUID |
+| `Username` | `username` | `string` |
+| `Email` | `email` | `string` |
+| `Enabled` | `enabled` | `bool` |
+| `RealmRoles` | `realm_roles` | `[]string`, never `nil` |
+
+#### `ErrRoleNotFound`
+
+Sentinel error wrapped by `AssignRealmRole` and `RemoveRealmRole` when the named realm role does not exist. Map it to `404` in your handlers.
+
+#### `ErrAdminRequestFailed`
+
+Sentinel error wrapped by every Admin API failure with a non-2xx status, including a rejected service-account login. The error message includes the status code and the start of Keycloak's response body.
+
+```go
+if errors.Is(err, keygonomics.ErrAdminRequestFailed) {
+	log.Printf("keycloak admin api: %v", err) // e.g. "...: status 403: {"error":"unknown_error"}"
+}
+```
+
 ### Middleware and handler helpers
 
-#### `RequireAuth(v *keygonomics.Verifier) gin.HandlerFunc`
+#### `RequireAuth(kc *keygonomics.Client) gin.HandlerFunc`
 
 The authentication middleware. Reads the `Authorization` header, verifies the token, and stores the claims in the Gin context. Aborts with `401` and a JSON error body if anything is wrong. Attach it to a group so every route beneath it is protected.
 
 ```go
-api := r.Group("/api", keygonomics.RequireAuth(verifier))
+api := r.Group("/api", keygonomics.RequireAuth(kc))
 api.GET("/me", meHandler) // only reached with a valid token
 ```
 
@@ -430,6 +546,7 @@ Two common surprises:
 - Tokens without an `exp` claim are rejected.
 - Signing keys are refreshed hourly and on encountering an unknown key ID, so key rotation in Keycloak is picked up automatically.
 - The `iss` and `aud` claims are not checked. If your service must only accept tokens for a specific audience, check `claims.Audience` in a small middleware of your own.
+- `ListUsers`, `AssignRealmRole`, and `RemoveRealmRole` act with your service's permissions, not the caller's. Always put them behind `RequireAuth` plus a role check, and give the service account only `view-users` and `manage-users`, not `realm-admin`.
 
 ## License
 

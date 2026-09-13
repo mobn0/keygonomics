@@ -31,7 +31,7 @@ type ErrorResponse struct {
 // request is aborted with 401 Unauthorized, a WWW-Authenticate header, and
 // an [ErrorResponse] JSON body. On success the claims are stored in the
 // context under [ClaimsContextKey] and the next handler runs.
-func RequireAuth(v *Verifier) gin.HandlerFunc {
+func RequireAuth(kc *Client) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		raw, err := ExtractBearerToken(c.GetHeader("Authorization"))
 		if err != nil {
@@ -40,7 +40,7 @@ func RequireAuth(v *Verifier) gin.HandlerFunc {
 			return
 		}
 
-		claims, err := v.Verify(raw)
+		claims, err := kc.Verify(raw)
 		if err != nil {
 			c.Header("WWW-Authenticate", `Bearer realm="keycloak", error="invalid_token"`)
 			c.AbortWithStatusJSON(http.StatusUnauthorized, ErrorResponse{Error: "invalid token"})

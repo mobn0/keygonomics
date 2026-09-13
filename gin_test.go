@@ -28,8 +28,8 @@ func init() {
 }
 
 type fixture struct {
-	priv     *rsa.PrivateKey
-	verifier *keygonomics.Verifier
+	priv *rsa.PrivateKey
+	kc   *keygonomics.Client
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -52,7 +52,16 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &fixture{priv: priv, verifier: keygonomics.NewWithKeyfunc(kf)}
+	kc, err := keygonomics.New(keygonomics.Config{
+		Issuer:       "https://sso.example.com/realms/test",
+		ClientID:     "backend",
+		ClientSecret: "s3cret",
+		Keyfunc:      kf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &fixture{priv: priv, kc: kc}
 }
 
 // token signs a token with the given realm and client roles.
@@ -88,7 +97,7 @@ func (f *fixture) router() *gin.Engine {
 		c.JSON(http.StatusOK, gin.H{"authenticated": err == nil})
 	})
 
-	api := r.Group("/api", keygonomics.RequireAuth(f.verifier))
+	api := r.Group("/api", keygonomics.RequireAuth(f.kc))
 	api.GET("/me", func(c *gin.Context) {
 		claims, _ := keygonomics.GetClaims(c)
 		uuid, _ := keygonomics.GetUUID(c)
@@ -256,7 +265,7 @@ func TestAbortStopsChain(t *testing.T) {
 	f := newFixture(t)
 	r := gin.New()
 	reached := false
-	r.GET("/x", keygonomics.RequireAuth(f.verifier), func(*gin.Context) { reached = true })
+	r.GET("/x", keygonomics.RequireAuth(f.kc), func(*gin.Context) { reached = true })
 
 	if w := do(t, r, "/x", ""); w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d", w.Code)

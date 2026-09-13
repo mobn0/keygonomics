@@ -8,33 +8,49 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/MicahParks/jwkset"
+	"github.com/MicahParks/keyfunc/v3"
 	"github.com/golang-jwt/jwt/v5"
 )
 
 const testKID = "test-key-1"
 
-// testKeys holds a generated RSA key pair and a JWKS server that publishes
-// its public half.
-type testKeys struct {
-	priv     *rsa.PrivateKey
-	server   *httptest.Server
-	verifier *Verifier
+// fakeKeycloak is a minimal in-memory stand-in for the parts of Keycloak
+// that Client uses: the realm JWKS, the token endpoint, and the slice of the
+// Admin REST API that deals with users and realm role mappings.
+type fakeKeycloak struct {
+	t      *testing.T
+	server *httptest.Server
+	priv   *rsa.PrivateKey
+	jwks   []byte
+	kc     *Client
+
+	mu          sync.Mutex
+	tokenCalls  int
+	expiresIn   int
+	users       []map[string]any
+	roles       map[string]string   // name -> id
+	mappings    map[string][]string // userID -> role names
+	failAdminAs int                 // if non-zero, every admin request returns this status
 }
 
-func newTestKeys(t *testing.T) *testKeys {
+func newFakeKeycloak(t *testing.T) *fakeKeycloak {
 	t.Helper()
 
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatalf("generating RSA key: %v", err)
 	}
-
 	jwk, err := jwkset.NewJWKFromKey(priv.Public(), jwkset.JWKOptions{
 		Metadata: jwkset.JWKMetadataOptions{
 			ALG: jwkset.AlgRS256,
@@ -50,24 +66,35 @@ func newTestKeys(t *testing.T) *testKeys {
 		t.Fatalf("marshalling JWKS: %v", err)
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(jwks)
-	}))
-	t.Cleanup(server.Close)
+	f := &fakeKeycloak{
+		t:         t,
+		priv:      priv,
+		jwks:      jwks,
+		expiresIn: 300,
+		roles:     map[string]string{},
+		mappings:  map[string][]string{},
+	}
+	f.server = httptest.NewServer(http.HandlerFunc(f.handle))
+	t.Cleanup(f.server.Close)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	v, err := NewContext(ctx, server.URL)
+	f.kc, err = NewContext(ctx, f.config())
 	if err != nil {
-		t.Fatalf("creating Verifier: %v", err)
+		t.Fatalf("creating Client: %v", err)
 	}
-	return &testKeys{priv: priv, server: server, verifier: v}
+	return f
+}
+
+func (f *fakeKeycloak) issuer() string { return f.server.URL + "/realms/test" }
+
+func (f *fakeKeycloak) config() Config {
+	return Config{Issuer: f.issuer(), ClientID: "backend", ClientSecret: "s3cret"}
 }
 
 // sign produces a token signed by the test key with the given claims.
-func (k *testKeys) sign(t *testing.T, method jwt.SigningMethod, key any, kid string, claims jwt.Claims) string {
+func (k *fakeKeycloak) sign(t *testing.T, method jwt.SigningMethod, key any, kid string, claims jwt.Claims) string {
 	t.Helper()
 	tok := jwt.NewWithClaims(method, claims)
 	if kid != "" {
@@ -98,7 +125,7 @@ func baseClaims(exp time.Time) Claims {
 }
 
 func TestVerify(t *testing.T) {
-	k := newTestKeys(t)
+	k := newFakeKeycloak(t)
 	otherRSA, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -221,7 +248,7 @@ func TestVerify(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			claims, err := k.verifier.Verify(tt.token(t))
+			claims, err := k.kc.Verify(tt.token(t))
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("expected error, got nil")
@@ -247,12 +274,12 @@ func TestVerify(t *testing.T) {
 func TestVerifyMinimalKeycloakPayload(t *testing.T) {
 	// A token with no realm_access/resource_access at all must still parse,
 	// and the role helpers must behave sanely.
-	k := newTestKeys(t)
+	k := newFakeKeycloak(t)
 	c := Claims{RegisteredClaims: jwt.RegisteredClaims{
 		Subject:   "u1",
 		ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
 	}}
-	claims, err := k.verifier.Verify(k.sign(t, jwt.SigningMethodRS256, k.priv, testKID, c))
+	claims, err := k.kc.Verify(k.sign(t, jwt.SigningMethodRS256, k.priv, testKID, c))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,29 +294,77 @@ func TestVerifyMinimalKeycloakPayload(t *testing.T) {
 	}
 }
 
+func TestNewIssuerParsing(t *testing.T) {
+	f := newFakeKeycloak(t)
+	// A static keyfunc avoids a JWKS fetch so arbitrary issuers can be tested.
+	kf, err := keyfunc.NewJWKSetJSON(f.jwks)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		issuer   string
+		wantBase string
+		wantRlm  string
+		wantErr  bool
+	}{
+		{"https://sso.example.com/realms/foo", "https://sso.example.com", "foo", false},
+		{"https://sso.example.com/realms/foo/", "https://sso.example.com", "foo", false},
+		{"http://localhost:8080/auth/realms/dev", "http://localhost:8080/auth", "dev", false},
+		{"https://sso.example.com", "", "", true},
+		{"https://sso.example.com/realms/", "", "", true},
+		{"https://sso.example.com/realms/foo/extra", "", "", true},
+		{"", "", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.issuer, func(t *testing.T) {
+			kc, err := New(Config{Issuer: tt.issuer, ClientID: "id", ClientSecret: "secret", Keyfunc: kf})
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got client %+v", kc)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if kc.baseURL != tt.wantBase || kc.realm != tt.wantRlm {
+				t.Errorf("got base=%q realm=%q, want base=%q realm=%q", kc.baseURL, kc.realm, tt.wantBase, tt.wantRlm)
+			}
+		})
+	}
+}
+
 func TestNewErrors(t *testing.T) {
-	if _, err := New(""); err == nil {
-		t.Error("New(\"\") should fail")
+	f := newFakeKeycloak(t)
+
+	cfg := f.config()
+	cfg.ClientID = ""
+	if _, err := New(cfg); err == nil {
+		t.Error("empty client ID should fail")
 	}
-	if _, err := NewFromIssuer(""); err == nil {
-		t.Error("NewFromIssuer(\"\") should fail")
+	cfg = f.config()
+	cfg.ClientSecret = ""
+	if _, err := New(cfg); err == nil {
+		t.Error("empty client secret should fail")
 	}
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
-	if _, err := New(srv.URL); err == nil {
+	if _, err := New(Config{Issuer: srv.URL + "/realms/x", ClientID: "id", ClientSecret: "secret"}); err == nil {
 		t.Error("New with failing JWKS endpoint should fail")
 	}
 }
 
-func TestNilVerifier(t *testing.T) {
-	var v *Verifier
-	if _, err := v.Verify("x"); err == nil {
-		t.Error("nil Verifier should return an error")
+func TestNilClient(t *testing.T) {
+	var kc *Client
+	if _, err := kc.Verify("x"); err == nil {
+		t.Error("nil Client should return an error")
 	}
-	if _, err := (&Verifier{}).Verify("x"); err == nil {
-		t.Error("zero Verifier should return an error")
+	if _, err := (&Client{}).Verify("x"); err == nil {
+		t.Error("zero Client should return an error")
 	}
 }
 
@@ -437,5 +512,286 @@ func TestClaimsJSONShape(t *testing.T) {
 	}
 	if !c.HasClientRole("backend", "admin") || !c.HasClientRole("account", "manage-account") {
 		t.Error("resource_access not parsed")
+	}
+}
+
+func (f *fakeKeycloak) handle(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	writeJSON := func(v any) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(v)
+	}
+
+	if r.URL.Path == "/realms/test/protocol/openid-connect/certs" {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(f.jwks)
+		return
+	}
+
+	if r.URL.Path == "/realms/test/protocol/openid-connect/token" {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if r.Form.Get("grant_type") != "client_credentials" || r.Form.Get("client_id") != "backend" || r.Form.Get("client_secret") != "s3cret" {
+			http.Error(w, `{"error":"unauthorized_client"}`, http.StatusUnauthorized)
+			return
+		}
+		f.tokenCalls++
+		writeJSON(map[string]any{"access_token": fmt.Sprintf("tok-%d", f.tokenCalls), "expires_in": f.expiresIn})
+		return
+	}
+
+	if !strings.HasPrefix(r.URL.Path, "/admin/realms/test/") {
+		http.NotFound(w, r)
+		return
+	}
+	if got := r.Header.Get("Authorization"); !strings.HasPrefix(got, "Bearer tok-") {
+		http.Error(w, "missing bearer", http.StatusUnauthorized)
+		return
+	}
+	if f.failAdminAs != 0 {
+		http.Error(w, `{"error":"boom"}`, f.failAdminAs)
+		return
+	}
+
+	rest := strings.TrimPrefix(r.URL.Path, "/admin/realms/test/")
+	parts := strings.Split(rest, "/")
+
+	switch {
+	case r.Method == http.MethodGet && rest == "users":
+		first, _ := strconv.Atoi(r.URL.Query().Get("first"))
+		max, _ := strconv.Atoi(r.URL.Query().Get("max"))
+		end := min(first+max, len(f.users))
+		if first > len(f.users) {
+			first = len(f.users)
+		}
+		writeJSON(f.users[first:end])
+
+	case r.Method == http.MethodGet && len(parts) == 2 && parts[0] == "roles":
+		id, ok := f.roles[parts[1]]
+		if !ok {
+			http.Error(w, `{"error":"Could not find role"}`, http.StatusNotFound)
+			return
+		}
+		writeJSON(map[string]string{"id": id, "name": parts[1]})
+
+	case len(parts) == 4 && parts[0] == "users" && parts[2] == "role-mappings" && parts[3] == "realm":
+		userID := parts[1]
+		switch r.Method {
+		case http.MethodGet:
+			out := []map[string]string{}
+			for _, name := range f.mappings[userID] {
+				out = append(out, map[string]string{"id": f.roles[name], "name": name})
+			}
+			writeJSON(out)
+		case http.MethodPost, http.MethodDelete:
+			if ct := r.Header.Get("Content-Type"); ct != "application/json" {
+				http.Error(w, "expected JSON body, got "+ct, http.StatusUnsupportedMediaType)
+				return
+			}
+			var reps []struct{ ID, Name string }
+			if err := json.NewDecoder(r.Body).Decode(&reps); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			for _, rep := range reps {
+				if f.roles[rep.Name] != rep.ID {
+					http.Error(w, "role id/name mismatch", http.StatusBadRequest)
+					return
+				}
+				cur := f.mappings[userID]
+				if r.Method == http.MethodPost {
+					if !slices.Contains(cur, rep.Name) {
+						f.mappings[userID] = append(cur, rep.Name)
+					}
+				} else {
+					f.mappings[userID] = slices.DeleteFunc(cur, func(n string) bool { return n == rep.Name })
+				}
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func TestClientTokenCaching(t *testing.T) {
+	f := newFakeKeycloak(t)
+	a := f.kc
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		if _, err := a.ListUsers(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if f.tokenCalls != 1 {
+		t.Errorf("token fetched %d times, want 1 (should be cached)", f.tokenCalls)
+	}
+
+	// Force expiry and confirm a fresh token is fetched.
+	a.mu.Lock()
+	a.tokenExpiry = time.Now().Add(-time.Second)
+	a.mu.Unlock()
+	if _, err := a.ListUsers(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if f.tokenCalls != 2 {
+		t.Errorf("token fetched %d times after expiry, want 2", f.tokenCalls)
+	}
+}
+
+func TestClientTokenFailure(t *testing.T) {
+	f := newFakeKeycloak(t)
+	cfg := f.config()
+	cfg.ClientSecret = "wrong-secret"
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.ListUsers(context.Background())
+	if err == nil {
+		t.Fatal("expected error with bad credentials")
+	}
+	if !errors.Is(err, ErrAdminRequestFailed) {
+		t.Errorf("error %v does not wrap ErrAdminRequestFailed", err)
+	}
+}
+
+func TestClientListUsers(t *testing.T) {
+	f := newFakeKeycloak(t)
+	// More than one page (page size is 100) to exercise pagination.
+	for i := 0; i < 250; i++ {
+		id := fmt.Sprintf("u%03d", i)
+		f.users = append(f.users, map[string]any{
+			"id": id, "username": "user" + id, "email": id + "@example.com", "enabled": i%2 == 0,
+		})
+	}
+	f.roles = map[string]string{"admin": "r-admin", "editor": "r-editor", "viewer": "r-viewer"}
+	f.mappings["u000"] = []string{"admin", "editor"}
+	f.mappings["u249"] = []string{"viewer"}
+
+	users, err := f.kc.ListUsers(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 250 {
+		t.Fatalf("got %d users, want 250", len(users))
+	}
+
+	byID := map[string]User{}
+	for _, u := range users {
+		byID[u.ID] = u
+		if u.RealmRoles == nil {
+			t.Errorf("user %s has nil RealmRoles, want non-nil", u.ID)
+		}
+	}
+	if u := byID["u000"]; u.Username != "useru000" || u.Email != "u000@example.com" || !u.Enabled ||
+		!slices.Equal(u.RealmRoles, []string{"admin", "editor"}) {
+		t.Errorf("u000 = %+v", u)
+	}
+	if u := byID["u001"]; u.Enabled || len(u.RealmRoles) != 0 {
+		t.Errorf("u001 = %+v", u)
+	}
+	if u := byID["u249"]; !slices.Equal(u.RealmRoles, []string{"viewer"}) {
+		t.Errorf("u249 = %+v", u)
+	}
+}
+
+func TestClientListUsersEmpty(t *testing.T) {
+	f := newFakeKeycloak(t)
+	users, err := f.kc.ListUsers(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if users == nil || len(users) != 0 {
+		t.Errorf("got %v, want empty non-nil slice", users)
+	}
+}
+
+func TestClientAssignAndRemoveRealmRole(t *testing.T) {
+	f := newFakeKeycloak(t)
+	f.users = []map[string]any{{"id": "u1", "username": "alice", "enabled": true}}
+	f.roles = map[string]string{"editor": "r-editor", "viewer": "r-viewer"}
+	f.mappings["u1"] = []string{"viewer"}
+	a := f.kc
+	ctx := context.Background()
+
+	if err := a.AssignRealmRole(ctx, "u1", "editor"); err != nil {
+		t.Fatalf("AssignRealmRole: %v", err)
+	}
+	if got := f.mappings["u1"]; !slices.Equal(got, []string{"viewer", "editor"}) {
+		t.Errorf("after assign, mappings = %v", got)
+	}
+
+	if err := a.RemoveRealmRole(ctx, "u1", "viewer"); err != nil {
+		t.Fatalf("RemoveRealmRole: %v", err)
+	}
+	if got := f.mappings["u1"]; !slices.Equal(got, []string{"editor"}) {
+		t.Errorf("after remove, mappings = %v", got)
+	}
+
+	// Round-trip through ListUsers to check the change is visible.
+	users, err := a.ListUsers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 1 || !slices.Equal(users[0].RealmRoles, []string{"editor"}) {
+		t.Errorf("ListUsers after changes = %+v", users)
+	}
+}
+
+func TestClientRoleNotFound(t *testing.T) {
+	f := newFakeKeycloak(t)
+	f.roles = map[string]string{"editor": "r-editor"}
+	a := f.kc
+	ctx := context.Background()
+
+	for _, fn := range []struct {
+		name string
+		call func() error
+	}{
+		{"assign", func() error { return a.AssignRealmRole(ctx, "u1", "nope") }},
+		{"remove", func() error { return a.RemoveRealmRole(ctx, "u1", "nope") }},
+	} {
+		t.Run(fn.name, func(t *testing.T) {
+			err := fn.call()
+			if err == nil {
+				t.Fatal("expected error for unknown role")
+			}
+			if !errors.Is(err, ErrRoleNotFound) {
+				t.Errorf("error %v does not wrap ErrRoleNotFound", err)
+			}
+		})
+	}
+	if len(f.mappings["u1"]) != 0 {
+		t.Errorf("mappings should be untouched, got %v", f.mappings["u1"])
+	}
+}
+
+func TestClientServerError(t *testing.T) {
+	f := newFakeKeycloak(t)
+	f.failAdminAs = http.StatusForbidden
+	a := f.kc
+	ctx := context.Background()
+
+	_, err := a.ListUsers(ctx)
+	if err == nil || !errors.Is(err, ErrAdminRequestFailed) {
+		t.Errorf("ListUsers error = %v, want ErrAdminRequestFailed", err)
+	}
+	if !strings.Contains(err.Error(), "403") {
+		t.Errorf("error %q should mention the status code", err)
+	}
+	if err := a.AssignRealmRole(ctx, "u1", "editor"); err == nil || !errors.Is(err, ErrAdminRequestFailed) {
+		t.Errorf("AssignRealmRole error = %v, want ErrAdminRequestFailed", err)
+	}
+	if errors.Is(err, ErrRoleNotFound) {
+		t.Error("a 403 must not be reported as ErrRoleNotFound")
 	}
 }
